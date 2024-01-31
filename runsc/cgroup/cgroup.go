@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff"
+	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
@@ -348,6 +349,7 @@ type cgroupV1 struct {
 // systemd. This requires systemd (>=v244) to be running on the host and the
 // cgroup path to be in the form `slice:prefix:name`.
 func NewFromSpec(spec *specs.Spec, useSystemd bool) (Cgroup, error) {
+	log.Debugf("cgroups: NewFromSpec %+v, useSystemd %t", spec, useSystemd)
 	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
 		return nil, nil
 	}
@@ -360,6 +362,7 @@ func NewFromSpec(spec *specs.Spec, useSystemd bool) (Cgroup, error) {
 // systemd. This requires systemd (>=v244) to be running on the host and the
 // cgroup path to be in the form `slice:prefix:name`.
 func NewFromPath(cgroupsPath string, useSystemd bool) (Cgroup, error) {
+	log.Debugf("cgroups: NewFromPath %s, useSystemd %t", cgroupsPath, useSystemd)
 	return new("self", cgroupsPath, useSystemd)
 }
 
@@ -368,6 +371,7 @@ func NewFromPath(cgroupsPath string, useSystemd bool) (Cgroup, error) {
 // systemd. This requires systemd (>=v244) to be running on the host and the
 // cgroup path to be in the form `slice:prefix:name`.
 func NewFromPid(pid int, useSystemd bool) (Cgroup, error) {
+	log.Debugf("cgroups: NewFromPid %d, useSystemd %t", pid, useSystemd)
 	return new(strconv.Itoa(pid), "", useSystemd)
 }
 
@@ -378,6 +382,17 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 		cg      Cgroup
 	)
 
+	if !IsOnlyV2() && strings.Contains(cgroupsPath, ":") {
+		// Hack cgroupsv1 + systemd cgroups
+		path, err := hackSystemdCgroupsV1(cgroupsPath)
+		if err == nil {
+			log.Debugf("cgroups: hack got new path %s", path)
+			cgroupsPath = fmt.Sprintf("%s/%s", path, strings.ReplaceAll(cgroupsPath, ":", "/"))
+		} else {
+			log.Debugf("cgroups: hack got err %w", err)
+		}
+	}
+
 	// If path is relative, load cgroup paths for the process to build the
 	// relative paths.
 	if !filepath.IsAbs(cgroupsPath) {
@@ -386,6 +401,8 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 			return nil, fmt.Errorf("finding current cgroups: %w", err)
 		}
 	}
+
+	log.Debugf("cgroups: new %+v", parents)
 
 	if IsOnlyV2() {
 		// The cgroupsPath is in a special `slice:prefix:name` format for systemd
@@ -409,6 +426,42 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 	}
 	log.Debugf("New cgroup for pid: %s, %T: %+v", pid, cg, cg)
 	return cg, nil
+}
+
+func hackSystemdCgroupsV1(cgroupsPath string) (string, error) {
+	systemdCgroupParent := strings.Split(cgroupsPath, ":")[0]
+	ctx := context.Background()
+	conn, err := systemdDbus.NewWithContext(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	basePath := ""
+	currentContext := systemdCgroupParent
+
+	for {
+		property, err := conn.GetUnitPropertyContext(ctx, currentContext, "Wants")
+		if err != nil {
+			return "", err
+		}
+
+		wants := property.Value.Value().([]string)
+		if len(wants) == 1 {
+			// Indicates the root slice essentially
+			if wants[0] == "-.slice" {
+				return fmt.Sprintf("/%s", basePath), nil
+			}
+			if basePath == "" {
+				basePath = wants[0]
+			} else {
+				basePath = fmt.Sprintf("%s/%s", wants[0], basePath)
+			}
+
+			currentContext = wants[0]
+		} else {
+			return "", fmt.Errorf("property %s has multiple Want targets defined", currentContext)
+		}
+	}
 }
 
 // CgroupJSON is a wrapper for Cgroup that can be encoded to JSON.
@@ -480,7 +533,7 @@ func (c *CgroupJSON) MarshalJSON() ([]byte, error) {
 // already exists, it means that the caller has already provided a
 // pre-configured cgroups, and 'res' is ignored.
 func (c *cgroupV1) Install(res *specs.LinuxResources) error {
-	log.Debugf("Installing cgroup path %q", c.Name)
+	log.Debugf("Installing new cgroup path %q", c.Name)
 
 	// Clean up partially created cgroups on error. Errors during cleanup itself
 	// are ignored.
